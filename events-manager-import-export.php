@@ -3,13 +3,15 @@
 Plugin Name: Events Manager Import Export
 Plugin URI: https://github.com/webaware/events-manager-import-export
 Description: import and export function for Events Manager
-Version: 0.0.11
+Version: 0.0.13
 Author: WebAware
-Author URI: http://webaware.com.au/
+Author URI: https://shop.webaware.com.au/
+Text Domain: events-manager-import-export
+Domain Path: /languages/
 */
 
 /*
-copyright (c) 2012-2016 WebAware Pty Ltd (email : support@webaware.com.au)
+copyright (c) 2012-2019 WebAware Pty Ltd (email : support@webaware.com.au)
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -33,8 +35,14 @@ if (!defined('ABSPATH')) {
 define('EM_IMPEXP_PLUGIN_FILE', __FILE__);
 define('EM_IMPEXP_PLUGIN_ROOT', dirname(__FILE__) . '/');
 define('EM_IMPEXP_PLUGIN_NAME', basename(dirname(__FILE__)) . '/' . basename(__FILE__));
-define('EM_IMPEXP_PLUGIN_VERSION', '0.0.11');
+define('EM_IMPEXP_MIN_PHP', '5.6');
+define('EM_IMPEXP_PLUGIN_VERSION', '0.0.12');
 
-// instantiate the plug-in
-require EM_IMPEXP_PLUGIN_ROOT . 'includes/class.EM_ImpExpPlugin.php';
-EM_ImpExpPlugin::getInstance();
+require EM_IMPEXP_PLUGIN_ROOT . 'includes/functions-global.php';
+
+if (version_compare(PHP_VERSION, EM_IMPEXP_MIN_PHP, '<')) {
+	add_action('admin_notices', 'em_impexp_fail_php_version');
+	return;
+}
+
+require EM_IMPEXP_PLUGIN_ROOT . 'includes/bootstrap.php';

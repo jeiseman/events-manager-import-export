@@ -1,35 +1,31 @@
 <?php
+namespace webaware\em_import_export;
+
+use DateTimeZone;
+use EM_Categories;
+use EM_Category;
+use EM_Event;
+use EM_Events;
+use EM_Location;
+use Exception;
+use XMLReader;
+
+use ParseCsv\Csv;
 
 if (!defined('ABSPATH')) {
 	exit;
 }
 
-class EM_ImpExpImport {
-
-	protected $plugin;
-	protected $menuPage;
-
-	/**
-	* @param EM_ImpExpPlugin $plugin handle to the plugin object
-	* @param string $menuPage slug for menu page
-	*/
-	public function __construct($plugin, $menuPage) {
-		$this->plugin = $plugin;
-		$this->menuPage = $menuPage;
-	}
+class Importer {
 
 	/**
 	* render the admin page
 	*/
-	public function render() {
-		$action = self::getPostValue('action');
-		$format = self::getPostValue('imp_format');
-
-		if (self::isFormPost() && $action === 'em_impexp_import') {
+	public function render($admin_url) {
+		if (!empty($_POST['action']) && $_POST['action'] === 'em_impexp_import') {
+			$format = empty($_POST['imp_format']) ? '' : wp_unslash($_POST['imp_format']);
 			$this->importEvents($format);
 		}
-
-		$url = add_query_arg(array('post_type' => EM_POST_TYPE_EVENT, 'page' => $this->menuPage), admin_url('edit.php'));
 
 		include EM_IMPEXP_PLUGIN_ROOT . 'views/import.php';
 	}
@@ -48,22 +44,22 @@ class EM_ImpExpImport {
 					break;
 
 				case UPLOAD_ERR_NO_FILE:
-					$errmsg = '# no upload file selected.';
+					$errmsg = _x('No upload file selected.', 'error', 'events-manager-import-export');
 					break;
 
 				case UPLOAD_ERR_INI_SIZE:
 				case UPLOAD_ERR_FORM_SIZE:
-					$errmsg = '# error uploading file - file too big.';
+					$errmsg = _x('Error uploading file - file too big.', 'error', 'events-manager-import-export');
 					break;
 
 				default:
-					$errmsg = '# error uploading file.';
+					$errmsg = _x('Error uploading file.', 'error', 'events-manager-import-export');
 					break;
 
 			}
 		}
 		else {
-			$errmsg = '# no upload file selected.';
+			$errmsg = _x('No upload file selected.', 'error', 'events-manager-import-export');
 		}
 
 		if (empty($errmsg)) {
@@ -82,47 +78,51 @@ class EM_ImpExpImport {
 
 				}
 			}
-			catch (Exception $e) {
-				$errmsg = '# error importing events: ' . esc_html($e->getMessage());
+			catch (ImportException $e) {
+				$errmsg = sprintf(_x('Error importing events: %s', 'error', 'events-manager-import-export'), $e->getMessage());
 			}
 		}
 
 		if (!empty($errmsg)) {
-			$this->plugin->showError($errmsg);
+			show_admin_error($errmsg);
 		}
 	}
 
 	/**
 	* import events from xCal upload
 	* @param string $filepath
+	* @throws ImportException
 	*/
 	protected function importEventsXCal($filepath) {
 		global $wpdb;
 
 		$xml = new XMLReader();
 		if (!$xml->open($filepath, 'UTF-8')) {
-			throw new EM_ImpExpImportException('error opening xCal file.');
+			throw new ImportException(_x("Can't open xCal file.", 'error', 'events-manager-import-export'));
 		}
 
 		$text = '';
 		$haveRecord = false;
 		$haveLocation = false;
 		$records = 0;
-		$attrs = array();
+		$attrs = [];
 		$eventCategories = self::getEventCategories();
 		$eventCountries = self::getEventCountries();
+
+		$timezone = new DateTimeZone(get_option('timezone_string'));
 
 		while ($xml->read()) {
 			switch ($xml->nodeType) {
 
 				case XMLReader::ELEMENT:
 					if ($xml->name === 'vevent') {
-						$data = array(
+						$data = [
 							'uid' => '',
 							'url' => '',
 							'summary' => '',
 							'dtstart' => '',
 							'dtend' => '',
+							'dtstamp' => '',
 							'categories' => '',
 							'freq' => '',
 							'byday' => '',
@@ -140,8 +140,8 @@ class EM_ImpExpImport {
 							'x-location_region' => '',
 							'x-location_latitude' => '',
 							'x-location_longitude' => '',
-						);
-						$attrs = array();
+						];
+						$attrs = [];
 						$haveRecord = true;
 						$haveLocation = false;
 					}
@@ -172,7 +172,6 @@ class EM_ImpExpImport {
 									$location->location_region    = $data['x-location_region'];
 									$location->location_latitude  = $data['x-location_latitude'];
 									$location->location_longitude = $data['x-location_longitude'];
-									self::maybeSetCoordinates($location);
 									$location->save();
 								}
 							}
@@ -180,37 +179,42 @@ class EM_ImpExpImport {
 							// try to find existing event with matching unique ID first, so can update it
 							$event = false;
 							if ($data['uid']) {
-								add_filter('em_events_get_default_search', array(__CLASS__, 'filterEventArgs'), 10, 2);
-								add_filter('em_events_build_sql_conditions', array(__CLASS__, 'filterEventSQL'), 10, 2);
-
-								$event = EM_Events::get(array('em_impexp_uid' => $data['uid']));
+								$event = EM_Events::get([EVENT_ATTR_UID => $data['uid']]);
 								$event = empty($event[0]) ? false : $event[0];
-
-								remove_filter('em_events_get_default_search', array(__CLASS__, 'filterEventArgs'), 10, 2);
-								remove_filter('em_events_build_sql_conditions', array(__CLASS__, 'filterEventSQL'), 10, 2);
 							}
 							if (!$event) {
 								// must create a new event
 								$event = new EM_Event();
 							}
+							$event->post_id = $data['uid'];	// post_id is now NOT NULL
 							$event->location_id = $location ? $location->location_id : 0;
-							$event->event_attributes['em_impexp_uid'] = $data['uid'];
-							$event->event_attributes['em_impexp_url'] = $data['url'];
+							$event->event_attributes[EVENT_ATTR_UID] = $data['uid'];
+							$event->event_attributes[EVENT_ATTR_URL] = $data['url'];
 							$event->event_name = $data['summary'];
-							$event->post_content = $data['x-post_content'];
-							$event->post_excerpt = $data['x-post_excerpt'];
+							$event->post_content = apply_filters('em_impexp_import_content', $data['x-post_content'], $data, 'xCal');
+							$event->post_excerpt = apply_filters('em_impexp_import_excerpt', $data['x-post_excerpt'], $data, 'xCal');
+
 							if ($data['dtstart']) {
-								$event->start = strtotime($data['dtstart']);
-								$event->event_start_date = date('Y-m-d', $event->start);
-								$event->event_start_time = date('H:i:s', $event->start);
+								$time_start = date_create_from_format('Y-m-d\TH:i:sT', $data['dtstart']);
+								$time_start->setTimezone($timezone);
+								$event->event_start_date = $time_start->format('Y-m-d');
+								$event->event_start_time = $time_start->format('H:i:s');
+								$event->start()->setTimestamp($time_start->getTimestamp());
 							}
 							if ($data['dtend']) {
-								$event->end = strtotime($data['dtend']);
-								$event->event_end_date = date('Y-m-d', $event->end);
-								$event->event_end_time = date('H:i:s', $event->end);
+								$time_end = date_create_from_format('Y-m-d\TH:i:sT', $data['dtend']);
+								$time_end->setTimezone($timezone);
+								$event->event_end_date = $time_end->format('Y-m-d');
+								$event->event_end_time = $time_end->format('H:i:s');
+								$event->end()->setTimestamp($time_end->getTimestamp());
 							}
-							$event->event_date_modified = current_time('mysql');
-							$event->event_all_day = ($event->event_start_time === '00:00:00' && $event->event_end_time === '00:00:00') ? 1 : 0;
+							if ($data['dtstamp']) {
+								$event->event_date_modified = date('Y-m-d H:i:s', strtotime($data['dtstamp']));
+							}
+							if ($data['dtstart'] && $data['dtend']) {
+								$time_diff = $time_start->diff($time_end);
+								$event->event_all_day = ($time_diff->format('%Y-%m-%d %H:%i:%s') === '00-0-0 23:59:59') ? 1 : 0;
+							}
 
 							foreach ($attrs as $attrName => $value) {
 								$event->event_attributes[$attrName] = $value;
@@ -222,10 +226,12 @@ class EM_ImpExpImport {
 									break;
 
 								case 'WEEKLY':
+									// phpcs:disable Squiz.PHP.CommentedOutCode.Found
 									//~ $event->freq = $data['freq'];
 									//~ $event->byday = $data['byday'];
 									//~ $event->interval = $data['interval'];
 									//~ $event->until = $data['until'];
+									// phpcs:enable
 									break;
 
 								case 'MONTHLY':
@@ -254,7 +260,7 @@ class EM_ImpExpImport {
 										}
 
 										if ($cat) {
-											$eventcats->categories[$cat->id] = $cat;
+											$eventcats->terms[$cat->id] = $cat;
 										}
 									}
 									$eventcats->save();
@@ -317,63 +323,66 @@ class EM_ImpExpImport {
 			}
 		}
 
-		$this->plugin->showMessage($records === 1 ? '1 events loaded' : "$records events loaded");
+		$this->showCount($records);
 	}
 
 	/**
 	* import events from CSV upload
 	* @param string $filepath
+	* @throws ImportException
 	*/
 	protected function importEventsCSV($filepath) {
 		global $wpdb;
 
 		$fp = fopen($filepath, 'r');
 		if ($fp === false) {
-			throw new EM_ImpExpImportException('error opening CSV file');
+			throw new ImportException(_x("Can't open CSV file.", 'error', 'events-manager-import-export'));
 		}
 
 		// read first line of CSV to make sure it's the correct format -- fgetscsv is fine for this simple task!
 		$header = fgetcsv($fp);
 		if ($header === false) {
-			throw new EM_ImpExpImportException('error reading import file or file is empty');
+			throw new ImportException(_x('error reading import file or file is empty', 'error', 'events-manager-import-export'));
 		}
 		if (is_null($header)) {
-			throw new EM_ImpExpImportException('import file handle is null');
+			throw new ImportException(_x('import file handle is null', 'error', 'events-manager-import-export'));
 		}
 		if (!is_array($header)) {
-			throw new EM_ImpExpImportException('import file did not scan as CSV');
+			throw new ImportException(_x('import file did not scan as CSV', 'error', 'events-manager-import-export'));
 		}
 		if (!in_array('summary', $header)) {
-			throw new EM_ImpExpImportException('import file does not contain a field "summary"');
+			throw new ImportException(_x('import file does not contain a field "summary"', 'error', 'events-manager-import-export'));
 		}
 
 		$wpdb->query('start transaction');
 
 		$records = 0;
 		$rows = 0;
-		$attrs = array();
+		$attrs = [];
 		$eventCategories = self::getEventCategories();
 		$eventCountries = self::getEventCountries();
 
-		$csv = new parseCSV();
+		$csv = new Csv();
 		$csv->fields = $header;
 
 		while ($line = fgets($fp)) {
 			$line = "\n$line\n";		// fix up line so that it can be parsed correctly
 
-			$cols = $csv->parse_string($line);
+			$cols = $csv->parseFile($line);
 
 			if ($cols) {
 				$rows++;
 				$cols = $cols[0];
 
 				// collect standard event properties
-				$data = array(
+				$data = [
 					'uid'                 => isset($cols['uid']) ? trim($cols['uid']) : '',
 					'url'                 => isset($cols['url']) ? self::safeURL($cols['url']) : '',
 					'summary'             => isset($cols['summary']) ? $cols['summary'] : '',
 					'dtstart'             => isset($cols['dtstart']) ? $cols['dtstart'] : '',
 					'dtend'               => isset($cols['dtend']) ? $cols['dtend'] : '',
+					'dtstamp'             => isset($cols['dtstamp']) ? $cols['dtstamp'] : '',
+					'dtformat'            => isset($cols['dtformat']) ? $cols['dtformat'] : '',
 					'categories'          => isset($cols['categories']) ? $cols['categories'] : '',
 					'freq'                => isset($cols['freq']) ? $cols['freq'] : '',
 					'byday'               => isset($cols['byday']) ? $cols['byday'] : '',
@@ -391,14 +400,14 @@ class EM_ImpExpImport {
 					'location_region'     => isset($cols['location_region']) ? $cols['location_region'] : '',
 					'location_latitude'   => isset($cols['location_latitude']) ? $cols['location_latitude'] : '',
 					'location_longitude'  => isset($cols['location_longitude']) ? $cols['location_longitude'] : '',
-				);
+				];
 
 				if (isset($eventCountries[strtolower($data['location_country'])])) {
 					$data['location_country'] = $eventCountries[strtolower($data['location_country'])];
 				}
 
 				// collect custom event attributes, being columns not found in standard event properties
-				$attrs = array();
+				$attrs = [];
 				foreach ($cols as $key => $value) {
 					if (strlen($value) > 0 && !isset($data[$key])) {
 						$attrs[$key] = $value;
@@ -412,6 +421,12 @@ class EM_ImpExpImport {
 						// try to find location by name
 						$location = $this->getLocationByName($data['location_name']);
 					}
+					// make sure the existing location is the same one by comparing postcodes
+					if ($data['location_postcode'] && $location->location_postcode != $data['location_postcode']) {
+						// this location has the same location_name as the one we want to create, but
+						// is actually a different location (e.g. City Hall in City A vs City Hall in City B)
+						$location = false;
+					}
 					if (!$location) {
 						// must create a new location object
 						$location = new EM_Location();
@@ -424,7 +439,6 @@ class EM_ImpExpImport {
 						$location->location_region    = $data['location_region'];
 						$location->location_latitude  = $data['location_latitude'];
 						$location->location_longitude = $data['location_longitude'];
-						self::maybeSetCoordinates($location);
 						$location->save();
 					}
 				}
@@ -432,44 +446,59 @@ class EM_ImpExpImport {
 				// try to find existing event with matching unique ID first, so can update it
 				$event = false;
 				if ($data['uid']) {
-					add_filter('em_events_get_default_search', array(__CLASS__, 'filterEventArgs'), 10, 2);
-					add_filter('em_events_build_sql_conditions', array(__CLASS__, 'filterEventSQL'), 10, 2);
-
-					$event = EM_Events::get(array('em_impexp_uid' => $data['uid']));
+					$event = EM_Events::get([EVENT_ATTR_UID => $data['uid']]);
 					$event = count($event) > 0 ? $event[0] : false;
-
-					remove_filter('em_events_get_default_search', array(__CLASS__, 'filterEventArgs'), 10, 2);
-					remove_filter('em_events_build_sql_conditions', array(__CLASS__, 'filterEventSQL'), 10, 2);
 				}
 				if (!$event) {
 					// must create a new event
 					$event = new EM_Event();
 				}
+				$event->post_id = $data['uid']; // post_id is now NOT NULL
 				$event->location_id = $location ? $location->location_id : 0;
-				$event->event_attributes['em_impexp_uid'] = $data['uid'];
-				$event->event_attributes['em_impexp_url'] = $data['url'];
+				$event->event_attributes[EVENT_ATTR_UID] = $data['uid'];
+				$event->event_attributes[EVENT_ATTR_URL] = $data['url'];
 				$event->event_name = $data['summary'];
-				$event->post_content = $data['post_content'];
-				$event->post_excerpt = $data['post_excerpt'];
-				if (preg_match('@^\\d\\d/\\d\\d/\\d\\d\\d\\d$@', $data['dtstart'])) {
-					$data['dtstart'] .= ' 00:00:00';
-					$event->start = date_create_from_format('d/m/Y H:i:s', $data['dtstart'])->getTimestamp();
-					$event->event_start_date = date('Y-m-d', $event->start);
-					$event->event_start_time = date('H:i:s', $event->start);
+				$event->post_content = apply_filters('em_impexp_import_content', $data['post_content'], $data, 'csv');
+				$event->post_excerpt = apply_filters('em_impexp_import_excerpt', $data['post_excerpt'], $data, 'csv');
+				$dtformat = 'd/m/Y H:i:s';
+				if (isset($data['dtformat']) && !empty($data['dtformat'])) {
+					$dtformat = $data['dtformat'];
 				}
-				if (preg_match('@^\\d\\d/\\d\\d/\\d\\d\\d\\d$@', $data['dtend'])) {
-					$data['dtend'] .= ' 00:00:00';
-					$event->end = date_create_from_format('d/m/Y H:i:s', $data['dtend'])->getTimestamp();
-					$event->event_end_date = date('Y-m-d', $event->end);
-					$event->event_end_time = date('H:i:s', $event->end);
+
+				# parse start time
+				$time_start = date_create_from_format($dtformat, $data['dtstart']);
+				if ($time_start === FALSE) {
+					throw new ImportException(
+						/* translators: %1$s = event summary; %2$s = date format; %3$s = start date */
+						sprintf(_x('invalid start date for %1$s: dtformat is %2$s and start date is %3$s', 'error', 'events-manager-import-export'),
+							$data['summary'], $dtformat, $data['dtstart'])
+					);
 				}
-				else {
-					$event->end = $event->start;
-					$event->event_end_date = $event->event_start_date;
-					$event->event_end_time = $event->event_start_time;
+				$event->event_start_date = $time_start->format('Y-m-d');
+				$event->event_start_time = $time_start->format('H:i:s');
+				$event->start()->setTimestamp($time_start->getTimestamp());
+
+				# parse end time
+				$time_end = date_create_from_format($dtformat, $data['dtend']);
+				if ($time_end === FALSE) {
+					throw new ImportException(
+						/* translators: %1$s = event summary; %2$s = date format; %3$s = end date */
+						sprintf(_x('invalid start date for %1$s: dtformat is %2$s and start date is %3$s', 'error', 'events-manager-import-export'),
+							$data['summary'], $dtformat, $data['dtend'])
+					);
 				}
-				$event->event_date_modified = current_time('mysql');
-				$event->event_all_day = ($event->event_start_time === '00:00:00' && $event->event_end_time === '00:00:00') ? 1 : 0;
+				$event->event_end_date = $time_end->format('Y-m-d');
+				$event->event_end_time = $time_end->format('H:i:s');
+				$event->end()->setTimestamp($time_end->getTimestamp());
+
+				if ($data['dtstamp']) {
+					$event->event_date_modified = date('Y-m-d H:i:s', strtotime($data['dtstamp']));
+				}
+
+				if ($data['dtstart'] && $data['dtend']) {
+					$time_diff = $time_start->diff($time_end);
+					$event->event_all_day = ($time_diff->format('%Y-%m-%d %H:%i:%s') === '00-0-0 23:59:59') ? 1 : 0;
+				}
 
 				foreach ($attrs as $attrName => $value) {
 					$event->event_attributes[$attrName] = $value;
@@ -482,10 +511,12 @@ class EM_ImpExpImport {
 						break;
 
 					case 'WEEKLY':
+						// phpcs:disable Squiz.PHP.CommentedOutCode.Found
 						//~ $event->freq = $data['freq'];
 						//~ $event->byday = $data['byday'];
 						//~ $event->interval = $data['interval'];
 						//~ $event->until = $data['until'];
+						// phpcs:enable
 						break;
 
 					case 'MONTHLY':
@@ -514,7 +545,7 @@ class EM_ImpExpImport {
 							}
 
 							if ($cat) {
-								$eventcats->categories[$cat->id] = $cat;
+								$eventcats->terms[$cat->id] = $cat;
 							}
 						}
 						$eventcats->save();
@@ -527,28 +558,15 @@ class EM_ImpExpImport {
 
 		$wpdb->query('commit');
 
-		$this->plugin->showMessage($records === 1 ? '1 events loaded' : "$records events loaded");
+		$this->showCount($records);
 	}
 
 	/**
-	* Is this web request a form post?
-	* Checks to see whether the HTML input form was posted.
-	* @return boolean
+	* show count of events loaded
+	* @param int $records
 	*/
-	protected static function isFormPost() {
-		return ($_SERVER['REQUEST_METHOD'] === 'POST');
-	}
-
-	/**
-	* Read a field from form post input.
-	*
-	* Guaranteed to return a string, trimmed of leading and trailing spaces, and with sloshes stripped out.
-	*
-	* @param string $fieldname name of the field in the form post
-	* @return string
-	*/
-	protected static function getPostValue($fieldname) {
-		return isset($_POST[$fieldname]) ? stripslashes(trim($_POST[$fieldname])) : '';
+	protected function showCount($records) {
+		show_admin_message(sprintf(_nx('%s event loaded', '%s events loaded', $records, 'import', 'events-manager-import-export'), number_format_i18n($records)));
 	}
 
 	/**
@@ -571,7 +589,7 @@ class EM_ImpExpImport {
 	*/
 	protected static function hasLocation($data) {
 		// get location fields that have a value
-		$location = array_filter(array (
+		$location = array_filter([
 			$data['location_name'],
 			$data['location_address'],
 			$data['location_town'],
@@ -581,7 +599,7 @@ class EM_ImpExpImport {
 			$data['location_region'],
 			$data['location_latitude'],
 			$data['location_longitude'],
-		), 'strlen');
+		], 'strlen');
 
 		// if any were found, return true
 		return count($location) > 0;
@@ -594,7 +612,7 @@ class EM_ImpExpImport {
 	*/
 	protected static function fudgeLocationName($data) {
 		// get location fields that have a value
-		$location = array_filter(array (
+		$location = array_filter([
 			$data['location_name'],
 			$data['location_address'],
 			$data['location_town'],
@@ -604,7 +622,7 @@ class EM_ImpExpImport {
 			$data['location_region'],
 			$data['location_latitude'],
 			$data['location_longitude'],
-		), 'strlen');
+		], 'strlen');
 
 		// return the first element
 		return array_shift($location);
@@ -620,14 +638,14 @@ class EM_ImpExpImport {
 
 		if ($locations === false) {
 			global $wpdb;
-			$sql = "
+			$sql = '
 				select location_name, location_id
-				from " . EM_LOCATIONS_TABLE . "
+				from ' . EM_LOCATIONS_TABLE . '
 				where location_status = 1
-			";
+			';
 			$rows = $wpdb->get_results($sql);
 
-			$locations = array();
+			$locations = [];
 			foreach ($rows as $row) {
 				$locations[strtolower($row->location_name)] = (int) $row->location_id;
 			}
@@ -641,107 +659,12 @@ class EM_ImpExpImport {
 	}
 
 	/**
-	* maybe set the coordinates for an imported location
-	* @param EM_Location &$location
-	*/
-	protected static function maybeSetCoordinates(&$location) {
-		if (empty($location->location_latitude) && empty($location->location_longitude)) {
-			// distill location down to fields that have been set
-			$parts = array_filter(array (
-						$location->location_address,
-						$location->location_town,
-						$location->location_state,
-						$location->location_postcode,
-						$location->get_country(),
-					), 'strlen');
-
-			if (!empty($parts)) {
-				$address = implode(', ', $parts);
-
-				// try to get a cached answer first
-				$cacheKey = 'em_impexp_addr_' . md5($address);
-				$coords = get_transient($cacheKey);
-
-				if ($coords === false) {
-					// build Google Maps geocoding query
-					$url = add_query_arg(array('address' => urlencode($address)), 'https://maps.googleapis.com/maps/api/geocode/json');
-
-					try {
-						// fetch coordinates
-						$response = wp_remote_get($url);
-
-						if (is_wp_error($response)) {
-							throw new Exception('http error = ' . $response->get_error_message());
-						}
-
-						$result = json_decode($response['body']);
-						if (!$result) {
-							throw new Exception("error decoding JSON\n" . $response['body']);
-						}
-
-						if ($result->status != 'OK') {
-							throw new Exception("error retrieving address: " . $result->status);
-						}
-
-						// success, build array with latitude and longitude from first result
-						$geolocation = $result->results[0]->geometry->location;
-						$coords = array('latitude' => $geolocation->lat, 'longitude' => $geolocation->lng);
-					}
-					catch (Exception $e) {
-						$coords = "address: $address; " . $e->getMessage();
-						error_log(__METHOD__ . ': ' . $coords);
-					}
-
-					// save coordinates to prevent unnecessary requery
-					set_transient($cacheKey, $coords, WEEK_IN_SECONDS);
-				}
-
-				// if we got coordinates, add them to the location
-				if (is_array($coords)) {
-					$location->location_latitude  = $coords['latitude'];
-					$location->location_longitude = $coords['longitude'];
-				}
-			}
-		}
-	}
-
-	/**
-	* filter the search arguments for an events search, to restore the em_impexp_uid argument
-	* @param array $filtered assoc. array of filtered arguments used for search
-	* @param array $args assoc. array of original search arguments
-	* @return array
-	*/
-	public static function filterEventArgs($filtered, $args) {
-		if (isset($args['em_impexp_uid'])) {
-			$filtered['em_impexp_uid'] = $args['em_impexp_uid'];
-		}
-
-		return $filtered;
-	}
-
-	/**
-	* filter the SQL where clause conditions for an events search, to include em_impexp_uid
-	* @param array $conditions where clause conditions
-	* @param array $args assoc. array of search arguments
-	* @return array
-	*/
-	public static function filterEventSQL($conditions, $args) {
-		if (isset($args['em_impexp_uid'])) {
-			$em_events_table = EM_EVENTS_TABLE;
-			$uid = esc_sql($args['em_impexp_uid']);
-			$conditions[] = "($em_events_table.event_attributes regexp '\"em_impexp_uid\";s:\[0-9\]+:\"$uid\"')";
-		}
-
-		return $conditions;
-	}
-
-	/**
 	* get a list of event categories, keyed by category name => category
 	* @return array
 	*/
 	public static function getEventCategories() {
 		$cats = EM_Categories::get();
-		$eventCats = array();
+		$eventCats = [];
 
 		foreach ($cats as $cat) {
 			$eventCats[$cat->name] = $cat;
@@ -756,7 +679,7 @@ class EM_ImpExpImport {
 	*/
 	public static function getEventCountries() {
 		$countries = em_get_countries();
-		$map = array();
+		$map = [];
 		foreach ($countries as $code => $name) {
 			$map[strtolower($name)] = $code;
 		}

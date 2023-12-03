@@ -1,1 +1,4 @@
 .svn
+dist
+node_modules
+vendor
